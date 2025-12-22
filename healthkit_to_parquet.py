@@ -129,7 +129,8 @@ def get_workout_route_path(workout_elem, export_dir: Path) -> Path | None:
         return None
 
     # Build full path (path is relative to export directory)
-    # Example: "workout-routes/route_2025-01-15_5.21pm.gpx"
+    # Strip leading slash - XML paths start with "/" but are relative
+    rel_path = rel_path.lstrip("/")
     gpx_path = export_dir / rel_path
 
     return gpx_path
