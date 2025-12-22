@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Apple HealthKit to Parquet Parser (Fast Version)
+Apple HealthKit to Parquet Parser (v2 - with GPS coordinates)
 
 Parses Apple Health export.xml and writes to a Parquet file.
+Extracts starting GPS coordinates from workout route GPX files.
 """
 
 import argparse
@@ -12,6 +13,9 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 from lxml import etree
+
+# GPX namespace - Apple uses GPX 1.1
+GPX_NS = {"gpx": "http://www.topografix.com/GPX/1/1"}
 
 
 def normalize_type(raw_type: str) -> str:
@@ -68,24 +72,92 @@ def parse_float(val: str) -> float | None:
         return None
 
 
-# Schema for the parquet file
+def get_gpx_start_point(gpx_path: Path) -> tuple[float | None, float | None]:
+    """
+    Extract the first track point (starting location) from a GPX file.
+
+    Returns (latitude, longitude) or (None, None) if not found.
+    """
+    if not gpx_path.exists():
+        return None, None
+
+    try:
+        tree = etree.parse(str(gpx_path))
+        root = tree.getroot()
+
+        # Try with namespace first (GPX 1.1)
+        trkpt = root.find(".//gpx:trkpt", GPX_NS)
+
+        # Fallback: try without namespace
+        if trkpt is None:
+            trkpt = root.find(".//{http://www.topografix.com/GPX/1/1}trkpt")
+
+        # Fallback: try with no namespace at all (some GPX files)
+        if trkpt is None:
+            trkpt = root.find(".//trkpt")
+
+        if trkpt is not None:
+            lat = parse_float(trkpt.get("lat"))
+            lon = parse_float(trkpt.get("lon"))
+            return lat, lon
+
+    except Exception:
+        pass
+
+    return None, None
+
+
+def get_workout_route_path(workout_elem, export_dir: Path) -> Path | None:
+    """
+    Extract the GPX file path from a Workout element's WorkoutRoute/FileReference.
+
+    Returns the full path to the GPX file, or None if not found.
+    """
+    # Look for WorkoutRoute child element
+    workout_route = workout_elem.find("WorkoutRoute")
+    if workout_route is None:
+        return None
+
+    # Look for FileReference child
+    file_ref = workout_route.find("FileReference")
+    if file_ref is None:
+        return None
+
+    # Get the path attribute
+    rel_path = file_ref.get("path")
+    if not rel_path:
+        return None
+
+    # Build full path (path is relative to export directory)
+    # Example: "workout-routes/route_2025-01-15_5.21pm.gpx"
+    gpx_path = export_dir / rel_path
+
+    return gpx_path
+
+
+# Schema for the parquet file - now includes start_lat and start_lon
 SCHEMA = pa.schema([
     ("type", pa.string()),
     ("value", pa.float64()),
     ("value_category", pa.string()),
     ("unit", pa.string()),
-    ("start_date", pa.string()),  # Store as string, convert later if needed
+    ("start_date", pa.string()),
     ("end_date", pa.string()),
     ("duration_min", pa.float64()),
     ("distance_km", pa.float64()),
     ("energy_kcal", pa.float64()),
     ("source_name", pa.string()),
+    ("start_lat", pa.float64()),
+    ("start_lon", pa.float64()),
 ])
 
 
 def parse_and_load(xml_path: Path, parquet_path: Path, batch_size: int = 500000,
                    progress_interval: int = 500000) -> dict:
     """Parse export.xml and write to Parquet."""
+
+    # Determine export directory (parent of export.xml)
+    export_dir = xml_path.parent
 
     # Column arrays for batch processing
     types = []
@@ -98,8 +170,10 @@ def parse_and_load(xml_path: Path, parquet_path: Path, batch_size: int = 500000,
     distance_kms = []
     energy_kcals = []
     source_names = []
+    start_lats = []
+    start_lons = []
 
-    stats = {"records": 0, "workouts": 0, "skipped": 0, "errors": 0}
+    stats = {"records": 0, "workouts": 0, "workouts_with_gps": 0, "skipped": 0, "errors": 0}
     start_time = time.time()
     last_progress = 0
     writer = None
@@ -112,12 +186,13 @@ def parse_and_load(xml_path: Path, parquet_path: Path, batch_size: int = 500000,
         total = total_rows()
         rate = total / elapsed if elapsed > 0 else 0
         print(
-            f"  Processed {total:,} rows ({stats['records']:,} records, {stats['workouts']:,} workouts, {stats['skipped']:,} skipped) "
-            f"in {elapsed:.1f}s ({rate:,.0f} rows/sec)")
+            f"  Processed {total:,} rows ({stats['records']:,} records, "
+            f"{stats['workouts']:,} workouts [{stats['workouts_with_gps']:,} with GPS], "
+            f"{stats['skipped']:,} skipped) in {elapsed:.1f}s ({rate:,.0f} rows/sec)")
 
     def flush_batch():
         nonlocal writer, types, values, value_categories, units, start_dates, end_dates
-        nonlocal duration_mins, distance_kms, energy_kcals, source_names
+        nonlocal duration_mins, distance_kms, energy_kcals, source_names, start_lats, start_lons
 
         if not types:
             return
@@ -133,6 +208,8 @@ def parse_and_load(xml_path: Path, parquet_path: Path, batch_size: int = 500000,
             "distance_km": distance_kms,
             "energy_kcal": energy_kcals,
             "source_name": source_names,
+            "start_lat": start_lats,
+            "start_lon": start_lons,
         }, schema=SCHEMA)
 
         if writer is None:
@@ -152,8 +229,19 @@ def parse_and_load(xml_path: Path, parquet_path: Path, batch_size: int = 500000,
         distance_kms = []
         energy_kcals = []
         source_names = []
+        start_lats = []
+        start_lons = []
 
     print("Starting parse...")
+    print(f"  Export directory: {export_dir}")
+
+    # Check for workout-routes folder
+    routes_dir = export_dir / "workout-routes"
+    if routes_dir.exists():
+        gpx_count = len(list(routes_dir.glob("*.gpx")))
+        print(f"  Found workout-routes folder with {gpx_count} GPX files")
+    else:
+        print(f"  No workout-routes folder found at {routes_dir}")
 
     context = etree.iterparse(str(xml_path), events=("end",),
                               tag=("Record", "Workout", "ActivitySummary", "Correlation"))
@@ -173,6 +261,8 @@ def parse_and_load(xml_path: Path, parquet_path: Path, batch_size: int = 500000,
                 distance_kms.append(None)
                 energy_kcals.append(None)
                 source_names.append(elem.get("sourceName"))
+                start_lats.append(None)  # Records don't have GPS
+                start_lons.append(None)
                 stats["records"] += 1
 
             elif elem.tag == "Workout":
@@ -189,6 +279,14 @@ def parse_and_load(xml_path: Path, parquet_path: Path, batch_size: int = 500000,
                 if distance_km and "mi" in distance_unit.lower():
                     distance_km *= 1.60934
 
+                # Extract GPS starting point from workout route
+                start_lat, start_lon = None, None
+                gpx_path = get_workout_route_path(elem, export_dir)
+                if gpx_path:
+                    start_lat, start_lon = get_gpx_start_point(gpx_path)
+                    if start_lat is not None:
+                        stats["workouts_with_gps"] += 1
+
                 types.append(normalize_type(elem.get("workoutActivityType", "")))
                 values.append(None)
                 value_categories.append(None)
@@ -199,6 +297,8 @@ def parse_and_load(xml_path: Path, parquet_path: Path, batch_size: int = 500000,
                 distance_kms.append(distance_km)
                 energy_kcals.append(parse_float(elem.get("totalEnergyBurned")))
                 source_names.append(elem.get("sourceName"))
+                start_lats.append(start_lat)
+                start_lons.append(start_lon)
                 stats["workouts"] += 1
 
             elif elem.tag in ("ActivitySummary", "Correlation"):
@@ -232,7 +332,7 @@ def parse_and_load(xml_path: Path, parquet_path: Path, batch_size: int = 500000,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Parse Apple Health export.xml into Parquet"
+        description="Parse Apple Health export.xml into Parquet (with GPS coordinates)"
     )
     parser.add_argument(
         "xml_path",
@@ -269,7 +369,7 @@ def main():
 
     print(f"\nDone! Wrote {args.output}")
     print(f"  Records:  {stats['records']:,}")
-    print(f"  Workouts: {stats['workouts']:,}")
+    print(f"  Workouts: {stats['workouts']:,} ({stats['workouts_with_gps']:,} with GPS)")
     print(f"  Skipped:  {stats['skipped']:,}")
     if stats["errors"]:
         print(f"  Errors:   {stats['errors']:,}")
@@ -282,4 +382,3 @@ def main():
 
 if __name__ == "__main__":
     exit(main())
-
